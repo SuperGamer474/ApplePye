@@ -2,30 +2,29 @@
 import WebKit
 import Foundation
 
-/// JSwift – sync + async JavaScript execution with natural `returnToSwift value` syntax
 public enum JSwift {
     private static let engine = JSEngine()
 
-    // MARK: - Synchronous (blocks the thread)
+    // MARK: - Synchronous
     public static func execute<T>(_ js: String) -> T {
         let semaphore = DispatchSemaphore(value: 0)
         var result: T!
-        var thrownError: Error?
+        var error: Error?
 
         Task {
             do {
                 let value = try await engine.evaluate(js)
                 result = value as? T ?? (value as! T)
             } catch {
-                thrownError = error
+                error = error
             }
             semaphore.signal()
         }
 
         semaphore.wait()
 
-        if let error = thrownError {
-            fatalError("JSwift JavaScript error: \(error.localizedDescription)")
+        if let error = error {
+            fatalError("JSwift error: \(error.localizedDescription)")
         }
         return result
     }
@@ -33,64 +32,54 @@ public enum JSwift {
     // MARK: - Async/Await
     public static func executeAsync<T: Decodable>(_ js: String) async throws -> T {
         let value = try await engine.evaluate(js)
-
-        if let value = value as? T {
-            return value
-        }
-
+        if let value = value as? T { return value }
         let data = try JSONSerialization.data(withJSONObject: value)
         return try JSONDecoder().decode(T.self, from: data)
     }
 }
 
-// MARK: - Actor Engine (fixed initializer order)
+// MARK: - Actor Engine (Fixed: no use of 'self' during init)
 
 private actor JSEngine {
     private let webView: WKWebView
-    private let messageHandler: SwiftMessageHandler      // <-- stored reference so it lives
-
     private var pending: [UUID: CheckedContinuation<Any, Error>] = [:]
 
     init() {
-        // 1. Create configuration & controller first
+        // Step 1: Create config and controller
         let config = WKWebViewConfiguration()
         let controller = WKUserContentController()
 
-        // 2. Inject the magic `returnToSwift` bridge
-        let bridge = """
+        // Step 2: Inject returnToSwift bridge
+        let bridgeScript = """
         (function() {
-            const send = (value) => {
-                webkit.messageHandlers.jswift.postMessage({
-                    id: window.__jswift_id,
-                    value: value
-                });
-            };
+            const send = v => webkit.messageHandlers.jswift.postMessage({
+                id: window.__jswift_id,
+                value: v
+            });
             Object.defineProperty(window, 'returnToSwift', {
                 set: send,
-                get: () => { throw new Error('returnToSwift is write-only') }
+                get: () => { throw 'returnToSwift is write-only' }
             });
         })();
         """
+        controller.addUserScript(WKUserScript(
+            source: bridgeScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
 
-        controller.addUserScript(
-            WKUserScript(source: bridge,
-                         injectionTime: .atDocumentStart,
-                         forMainFrameOnly: true)
-        )
-
-        // 3. Create the hidden web view
+        // Step 3: Create web view
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.isHidden = true
 
-        // 4. NOW we can safely create the message handler (uses `self`)
+        // Step 4: NOW assign all stored properties (no 'self' used yet!)
+        self.webView = wv
+
+        // Step 5: Create handler AFTER all properties are initialized
         let handler = SwiftMessageHandler(engine: self)
         controller.add(handler, name: "jswift")
 
-        // 5. Assign all stored properties – order matters!
-        self.webView = wv
-        self.messageHandler = handler
-
-        // 6. Load a tiny page so the JS context is ready
+        // Step 6: Load blank page to initialize JS context
         wv.loadHTMLString("<script></script>", baseURL: nil)
     }
 
@@ -102,9 +91,7 @@ private actor JSEngine {
             let wrapped = """
             (function() {
                 window.__jswift_id = '\(id.uuidString)';
-                try {
-                    \(js)
-                } catch (e) {
+                try { \(js) } catch(e) {
                     webkit.messageHandlers.jswift.postMessage({
                         id: '\(id.uuidString)',
                         error: e.message || String(e)
@@ -115,8 +102,7 @@ private actor JSEngine {
 
             webView.evaluateJavaScript(wrapped) { _, error in
                 if let error = error {
-                    self.pending[id]?.resume(throwing: error)
-                    self.pending.removeValue(forKey: id)
+                    cont.resume(throwing: error)
                 }
             }
         }
@@ -128,19 +114,23 @@ private actor JSEngine {
     }
 
     func handle(id: UUID, error: String) {
-        pending[id]?.resume(throwing: NSError(domain: "JSwift", code: -1,
-                                              userInfo: [NSLocalizedDescriptionKey: error]))
+        pending[id]?.resume(throwing: NSError(
+            domain: "JSwift",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: error]
+        ))
         pending.removeValue(forKey: id)
     }
 }
 
-// MARK: - Message Handler
+// MARK: - Message Handler (weak to avoid retain cycle)
 
-private class SwiftMessageHandler: NSObject, WKScriptMessageHandler {
-    weak var engine: JSEngine?
+private final class SwiftMessageHandler: NSObject, WKScriptMessageHandler {
+    private weak var engine: JSEngine?
 
     init(engine: JSEngine) {
         self.engine = engine
+        super.init()
     }
 
     func userContentController(_ userContentController: WKUserContentController,
