@@ -1,2 +1,2 @@
-# ApplePye
-Effortlessly execute Python scripts in Swift projects.
+# JSwift
+Effortlessly execute JavaScript in Swift projects.
