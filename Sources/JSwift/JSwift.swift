@@ -2,29 +2,30 @@
 import WebKit
 import Foundation
 
+/// JSwift – sync + async JavaScript execution with natural `returnToSwift value` syntax
 public enum JSwift {
     private static let engine = JSEngine()
 
-    // MARK: - Synchronous
+    // MARK: - Synchronous (blocks until returnToSwift is called)
     public static func execute<T>(_ js: String) -> T {
         let semaphore = DispatchSemaphore(value: 0)
         var result: T!
-        var error: Error?
+        var executionError: Error?   // ← Renamed to avoid shadowing
 
         Task {
             do {
                 let value = try await engine.evaluate(js)
                 result = value as? T ?? (value as! T)
             } catch {
-                error = error
+                executionError = error   // ← Now assigns to outer var
             }
             semaphore.signal()
         }
 
         semaphore.wait()
 
-        if let error = error {
-            fatalError("JSwift error: \(error.localizedDescription)")
+        if let error = executionError {
+            fatalError("JSwift JavaScript error: \(error.localizedDescription)")
         }
         return result
     }
@@ -38,18 +39,16 @@ public enum JSwift {
     }
 }
 
-// MARK: - Actor Engine (Fixed: no use of 'self' during init)
+// MARK: - Actor Engine
 
 private actor JSEngine {
     private let webView: WKWebView
     private var pending: [UUID: CheckedContinuation<Any, Error>] = [:]
 
     init() {
-        // Step 1: Create config and controller
         let config = WKWebViewConfiguration()
         let controller = WKUserContentController()
 
-        // Step 2: Inject returnToSwift bridge
         let bridgeScript = """
         (function() {
             const send = v => webkit.messageHandlers.jswift.postMessage({
@@ -68,25 +67,21 @@ private actor JSEngine {
             forMainFrameOnly: true
         ))
 
-        // Step 3: Create web view
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.isHidden = true
 
-        // Step 4: NOW assign all stored properties (no 'self' used yet!)
         self.webView = wv
 
-        // Step 5: Create handler AFTER all properties are initialized
         let handler = SwiftMessageHandler(engine: self)
         controller.add(handler, name: "jswift")
 
-        // Step 6: Load blank page to initialize JS context
         wv.loadHTMLString("<script></script>", baseURL: nil)
     }
 
     func evaluate(_ js: String) async throws -> Any {
-        try await withCheckedThrowingContinuation { cont in
+        try await withCheckedThrowingContinuation { continuation in
             let id = UUID()
-            pending[id] = cont
+            pending[id] = continuation
 
             let wrapped = """
             (function() {
@@ -100,9 +95,10 @@ private actor JSEngine {
             })();
             """
 
-            webView.evaluateJavaScript(wrapped) { _, error in
-                if let error = error {
-                    cont.resume(throwing: error)
+            webView.evaluateJavaScript(wrapped) { _, jsError in
+                if let jsError = jsError {
+                    continuation.resume(throwing: jsError)
+                    self.pending.removeValue(forKey: id)
                 }
             }
         }
@@ -122,8 +118,6 @@ private actor JSEngine {
         pending.removeValue(forKey: id)
     }
 }
-
-// MARK: - Message Handler (weak to avoid retain cycle)
 
 private final class SwiftMessageHandler: NSObject, WKScriptMessageHandler {
     private weak var engine: JSEngine?
