@@ -7,7 +7,7 @@ public enum JSwift {
     private static let engine = JSEngine()
 
     // MARK: - Synchronous (blocks until returnToSwift is called)
-    public static func execute<T>(_ js: String) -> T {
+    public static func execute<T = Any>(_ js: String) -> T
         let semaphore = DispatchSemaphore(value: 0)
         var result: T!
         var executionError: Error?   // ← Renamed to avoid shadowing
